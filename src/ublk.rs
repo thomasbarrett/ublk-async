@@ -363,7 +363,6 @@ pub struct Controller {
 }
 struct ControllerInner {
     fd: std::fs::File,
-    uring: std::rc::Rc<IoUringAsync<squeue::Entry128>>
 }
 
 pub static CTRL_DEV: &str = "/dev/ublk-control";
@@ -375,23 +374,23 @@ impl Controller {
             write(true).
             open(CTRL_DEV)?;
 
-        Ok(Controller { inner: std::sync::Arc::new(ControllerInner{ fd, uring: uring.clone() }), uring })
+        Ok(Controller { inner: std::sync::Arc::new(ControllerInner{ fd }), uring })
     }
 
     pub async fn open_dev<B: BlockDevice + 'static>(&self, 
         queue: std::sync::Arc<B>,
         dev_id: i32) -> std::io::Result<Device<B>> {
-        let dev_info = self.inner.get_info(dev_id).await?;
+        let dev_info = self.inner.get_info(&self.uring, dev_id).await?;
         Device::new(std::sync::Arc::downgrade(&self.inner), queue, dev_info).await
     }
 
     pub async fn add_dev<B: BlockDevice + 'static>(&self, 
-        queue: std::sync::Arc<B>,
-        nr_hw_queues: u16, queue_depth: u16,
+        bdev: std::sync::Arc<B>,
+        queues: u16, queue_depth: u16,
     ) -> std::io::Result<Device<B>> {
         let mut dev_info: DeviceInfo = DeviceInfo::new_zeroed();
         dev_info.dev_id = -1;
-        dev_info.nr_hw_queues = nr_hw_queues;
+        dev_info.nr_hw_queues = queues;
         dev_info.queue_depth = queue_depth;
         dev_info.max_io_buf_bytes = 512 << 10;
     
@@ -409,14 +408,14 @@ impl Controller {
         let res = self.uring.push(op).await;
         assert!((res.result() as i32) >= 0, "read error: {}", res.result());
 
-        Device::new(std::sync::Arc::downgrade(&self.inner), queue, dev_info).await
+        Device::new(std::sync::Arc::downgrade(&self.inner), bdev, dev_info).await
     }
 }
 
 impl ControllerInner {
     
 
-    pub async fn del_dev(&self, dev_id: i32) -> std::io::Result<()> {
+    pub async fn del_dev(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32) -> std::io::Result<()> {
 
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
@@ -429,14 +428,14 @@ impl ControllerInner {
         ctrl_cmd.write_to_prefix(&mut cmd_bytes[..]);
 
         let op = opcode::UringCmd80::new(types::Fd(self.fd.as_raw_fd()), AdminCmd::DelDev as u32).cmd(cmd_bytes).build();
-        let res = self.uring.push(op).await;
+        let res = uring.push(op).await;
         assert!((res.result() as i32) >= 0, "read error: {}", res.result());
 
         Ok(())
     }
 
 
-    pub async fn get_info(&self, dev_id: i32) -> std::result::Result<DeviceInfo, std::io::Error> {
+    pub async fn get_info(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32) -> std::result::Result<DeviceInfo, std::io::Error> {
         let mut dev_info = DeviceInfo::new_zeroed();
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
@@ -449,7 +448,7 @@ impl ControllerInner {
         ctrl_cmd.write_to_prefix(&mut cmd_bytes[..]);
 
         let op = opcode::UringCmd80::new(types::Fd(self.fd.as_raw_fd()), AdminCmd::GetDevInfo as u32).cmd(cmd_bytes).build();
-        let res = self.uring.push(op).await;
+        let res = uring.push(op).await;
         assert!((res.result() as i32) >= 0, "read error: {}", res.result());
 
 
@@ -457,7 +456,7 @@ impl ControllerInner {
     }
 
 
-    pub async fn start_dev(&self, dev_id: i32, daemon_pid: u32) -> std::io::Result<()> {
+    pub async fn start_dev(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32, daemon_pid: u32) -> std::io::Result<()> {
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
             dev_id: dev_id,
@@ -469,14 +468,14 @@ impl ControllerInner {
         ctrl_cmd.write_to_prefix(&mut cmd_bytes[..]);
 
         let op = opcode::UringCmd80::new(types::Fd(self.fd.as_raw_fd()), AdminCmd::StartDev as u32).cmd(cmd_bytes).build();
-        let res = self.uring.push(op).await;
+        let res = uring.push(op).await;
         assert!((res.result() as i32) >= 0, "read error: {}", res.result());
 
 
         Ok(())
     }
 
-    pub async fn stop_dev(&self, dev_id: i32) -> std::io::Result<()>{
+    pub async fn stop_dev(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32) -> std::io::Result<()>{
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
             dev_id: dev_id,
@@ -488,14 +487,14 @@ impl ControllerInner {
         ctrl_cmd.write_to_prefix(&mut cmd_bytes[..]);
 
         let op = opcode::UringCmd80::new(types::Fd(self.fd.as_raw_fd()), AdminCmd::StopDev as u32).cmd(cmd_bytes).build();
-        let res = self.uring.push(op).await;
+        let res = uring.push(op).await;
         assert!((res.result() as i32) >= 0, "read error: {}", res.result());
 
 
         Ok(())
     }
 
-    pub async fn set_params(&self, dev_id: i32, mut params: Params) -> std::io::Result<()>{
+    pub async fn set_params(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32, mut params: Params) -> std::io::Result<()>{
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
             dev_id: dev_id,
@@ -509,14 +508,14 @@ impl ControllerInner {
         ctrl_cmd.write_to_prefix(&mut cmd_bytes[..]);
 
         let op = opcode::UringCmd80::new(types::Fd(self.fd.as_raw_fd()), AdminCmd::SetParams as u32).cmd(cmd_bytes).build();
-        let res = self.uring.push(op).await;
+        let res = uring.push(op).await;
         assert!((res.result() as i32) >= 0, "read error: {}", res.result());
 
 
         Ok(())
     }
 
-    pub async fn get_params(&self, dev_id: i32, params: &mut Params) -> std::io::Result<()> {
+    pub async fn get_params(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32, params: &mut Params) -> std::io::Result<()> {
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
             dev_id: dev_id,
@@ -530,7 +529,7 @@ impl ControllerInner {
         ctrl_cmd.write_to_prefix(&mut cmd_bytes[..]);
 
         let op = opcode::UringCmd80::new(types::Fd(self.fd.as_raw_fd()), AdminCmd::GetParams as u32).cmd(cmd_bytes).build();
-        let res = self.uring.push(op).await;
+        let res = uring.push(op).await;
         assert!((res.result() as i32) >= 0, "read error: {}", res.result());
 
         Ok(())
@@ -599,13 +598,13 @@ impl<B: BlockDevice + 'static> Device<B> {
         })})
     }
 
-    pub async fn close(self) -> std::io::Result<()> {
+    pub async fn close(self, uring: &IoUringAsync<squeue::Entry128>,) -> std::io::Result<()> {
         let dev_id = self.dev_id();
         match std::sync::Arc::try_unwrap(self.inner) {
             Ok(inner) => match std::sync::Arc::try_unwrap(inner.ctrl_fd) {
                 Ok(ctrl_fd) => {
                     drop(ctrl_fd);
-                    inner.ctlr.upgrade().unwrap().del_dev(dev_id).await?;
+                    inner.ctlr.upgrade().unwrap().del_dev(uring, dev_id).await?;
                 }
                 Err(_) => unreachable!()
             } 
@@ -633,9 +632,9 @@ impl<B: BlockDevice + 'static> Device<B> {
         Ok(())
     }
 
-    pub async fn start(&self) -> std::io::Result<()> {
+    pub async fn start(&self, uring: &IoUringAsync<squeue::Entry128>,) -> std::io::Result<()> {
   
-        self.inner.ctlr.upgrade().unwrap().set_params(self.dev_id(), Params {
+        self.inner.ctlr.upgrade().unwrap().set_params(uring, self.dev_id(), Params {
             len: std::mem::size_of::<Params>() as u32,
             types: ParamType::Basic as u32,
             basic: ParamBasic {
@@ -652,15 +651,15 @@ impl<B: BlockDevice + 'static> Device<B> {
             discard: ParamDiscard::new_zeroed(),
         }).await?;
 
-        self.inner.ctlr.upgrade().unwrap().start_dev(self.dev_id(), std::process::id()).await?;
+        self.inner.ctlr.upgrade().unwrap().start_dev(uring, self.dev_id(), std::process::id()).await?;
 
         Ok(())
     }
 
-    pub async fn stop(&self) -> std::io::Result<()> {
+    pub async fn stop(&self, uring: &IoUringAsync<squeue::Entry128>,) -> std::io::Result<()> {
         let ctlr = self.inner.ctlr.upgrade().unwrap();
 
-        let _ = ctlr.stop_dev(self.dev_id()).await?;
+        let _ = ctlr.stop_dev(uring, self.dev_id()).await?;
 
         let mut queue_done_guard = self.inner.queue_done.lock().unwrap();
         while let Some(queue_done) = queue_done_guard.pop() {

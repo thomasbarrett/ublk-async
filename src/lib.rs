@@ -38,9 +38,9 @@ mod tests {
                 let ctlr = ublk::Controller::new(uring.clone()).await.unwrap();
                 let dev = ctlr.add_dev(bdev, 1, 1).await.unwrap();  
                 dev.spawn_queue(uring.clone(), 0).unwrap();
-                dev.start().await.unwrap();
-                dev.stop().await.unwrap();
-                dev.close().await.unwrap();
+                dev.start(&uring).await.unwrap();
+                dev.stop(&uring).await.unwrap();
+                dev.close(&uring).await.unwrap();
             }).await;
         });
     }
