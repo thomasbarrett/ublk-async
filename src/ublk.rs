@@ -1,11 +1,11 @@
-use std::{os::unix::io::AsRawFd, mem::MaybeUninit};
+use std::{os::unix::io::AsRawFd};
 use std::os::unix::prelude::FromRawFd;
 use std::fmt::Debug;
 use zerocopy::{FromBytes,AsBytes};
 
 use io_uring_async::IoUringAsync;
-use io_uring::{opcode, types, squeue};
-use crate::block::BlockDevice;
+use io_uring::{opcode, types, squeue, cqueue};
+use bdev_async::bdev::{BlockDevice, BlockDeviceQueue};
 
 #[repr(u8)]
 pub enum AdminCmd {
@@ -359,7 +359,7 @@ type ControllerMethod<T> = Box<dyn FnOnce(&Controller) -> T>;
 
 pub struct Controller {
     inner: std::sync::Arc<ControllerInner>,
-    uring: std::rc::Rc<IoUringAsync<squeue::Entry128>>
+    uring: std::rc::Rc<IoUringAsync<squeue::Entry128, cqueue::Entry32>>
 }
 struct ControllerInner {
     fd: std::fs::File,
@@ -368,7 +368,7 @@ struct ControllerInner {
 pub static CTRL_DEV: &str = "/dev/ublk-control";
 
 impl Controller {
-    pub async fn new(uring: std::rc::Rc<IoUringAsync<squeue::Entry128>>) -> std::result::Result<Self, std::io::Error> {
+    pub async fn new(uring: std::rc::Rc<IoUringAsync<squeue::Entry128, cqueue::Entry32>>) -> std::result::Result<Self, std::io::Error> {
         let fd = std::fs::OpenOptions::new().
             read(true).
             write(true).
@@ -378,14 +378,14 @@ impl Controller {
     }
 
     pub async fn open_dev<B: BlockDevice + 'static>(&self, 
-        queue: std::sync::Arc<B>,
+        bdev: B,
         dev_id: i32) -> std::io::Result<Device<B>> {
         let dev_info = self.inner.get_info(&self.uring, dev_id).await?;
-        Device::new(std::sync::Arc::downgrade(&self.inner), queue, dev_info).await
+        Device::new(std::sync::Arc::downgrade(&self.inner), bdev, dev_info).await
     }
 
     pub async fn add_dev<B: BlockDevice + 'static>(&self, 
-        bdev: std::sync::Arc<B>,
+        bdev: B,
         queues: u16, queue_depth: u16,
     ) -> std::io::Result<Device<B>> {
         let mut dev_info: DeviceInfo = DeviceInfo::new_zeroed();
@@ -415,7 +415,7 @@ impl Controller {
 impl ControllerInner {
     
 
-    pub async fn del_dev(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32) -> std::io::Result<()> {
+    pub async fn del_dev(&self, uring: &IoUringAsync<squeue::Entry128, cqueue::Entry32>, dev_id: i32) -> std::io::Result<()> {
 
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
@@ -435,7 +435,7 @@ impl ControllerInner {
     }
 
 
-    pub async fn get_info(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32) -> std::result::Result<DeviceInfo, std::io::Error> {
+    pub async fn get_info(&self, uring: &IoUringAsync<squeue::Entry128, cqueue::Entry32>, dev_id: i32) -> std::result::Result<DeviceInfo, std::io::Error> {
         let mut dev_info = DeviceInfo::new_zeroed();
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
@@ -456,7 +456,7 @@ impl ControllerInner {
     }
 
 
-    pub async fn start_dev(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32, daemon_pid: u32) -> std::io::Result<()> {
+    pub async fn start_dev(&self, uring: &IoUringAsync<squeue::Entry128, cqueue::Entry32>, dev_id: i32, daemon_pid: u32) -> std::io::Result<()> {
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
             dev_id: dev_id,
@@ -475,7 +475,7 @@ impl ControllerInner {
         Ok(())
     }
 
-    pub async fn stop_dev(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32) -> std::io::Result<()>{
+    pub async fn stop_dev(&self, uring: &IoUringAsync<squeue::Entry128, cqueue::Entry32>, dev_id: i32) -> std::io::Result<()>{
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
             dev_id: dev_id,
@@ -494,7 +494,7 @@ impl ControllerInner {
         Ok(())
     }
 
-    pub async fn set_params(&self, uring: &IoUringAsync<squeue::Entry128>, dev_id: i32, mut params: Params) -> std::io::Result<()>{
+    pub async fn set_params(&self, uring: &IoUringAsync<squeue::Entry128, cqueue::Entry32>, dev_id: i32, mut params: Params) -> std::io::Result<()>{
         let mut cmd_bytes = [0u8; 80];
         let ctrl_cmd = CtrlCmd{
             dev_id: dev_id,
@@ -547,7 +547,7 @@ pub struct Device<B: BlockDevice + 'static> {
 pub struct DeviceInner<B: BlockDevice + 'static> {
     ctlr: std::sync::Weak<ControllerInner>,
     queue_done: std::sync::Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Receiver<()>>>>,
-    bdev: std::sync::Arc<B>,
+    bdev: B,
     info: DeviceInfo,
     ctrl_fd: std::sync::Arc<std::fs::File>,
 }
@@ -567,7 +567,7 @@ impl<B: BlockDevice + 'static> AsRawFd for Device<B> {
 impl<B: BlockDevice + 'static> Device<B> {
     unsafe fn from_raw_fd(
         ctlr: std::sync::Weak<ControllerInner>,
-        bdev: std::sync::Arc<B>,
+        bdev: B,
         uring: std::rc::Rc<IoUringAsync<squeue::Entry128>>,
         fd: i32, info: DeviceInfo) -> Device<B> {
         Self { inner: std::sync::Arc::new(DeviceInner {
@@ -581,7 +581,7 @@ impl<B: BlockDevice + 'static> Device<B> {
     
     async fn new(
         ctlr: std::sync::Weak<ControllerInner>,
-        bdev: std::sync::Arc<B>,
+        bdev: B,
         info: DeviceInfo) -> std::result::Result<Self, std::io::Error> {
         let dev_id = info.dev_id;
         let fd = std::fs::OpenOptions::new().
@@ -598,7 +598,7 @@ impl<B: BlockDevice + 'static> Device<B> {
         })})
     }
 
-    pub async fn close(self, uring: &IoUringAsync<squeue::Entry128>,) -> std::io::Result<()> {
+    pub async fn close(self, uring: &IoUringAsync<squeue::Entry128, cqueue::Entry32>,) -> std::io::Result<()> {
         let dev_id = self.dev_id();
         match std::sync::Arc::try_unwrap(self.inner) {
             Ok(inner) => match std::sync::Arc::try_unwrap(inner.ctrl_fd) {
@@ -618,21 +618,21 @@ impl<B: BlockDevice + 'static> Device<B> {
         self.inner.info.dev_id
     }
     
-    pub fn spawn_queue(&self, uring: std::rc::Rc<IoUringAsync<squeue::Entry128>>, queue_id: u16) -> std::io::Result<()> {
+    pub fn spawn_queue<Q: BlockDeviceQueue + 'static>(&self, queue: Q, uring: std::rc::Rc<IoUringAsync<squeue::Entry128, cqueue::Entry32>>, queue_id: u16) -> std::io::Result<()> {
         let mut queue_done_guard = self.inner.queue_done.lock().unwrap();
         let inner = self.inner.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
         queue_done_guard.push(receiver);
 
         tokio::task::spawn_local(async move {
-            inner.handle_queue(uring, queue_id as usize).await.unwrap();
+            inner.handle_queue(queue, uring, queue_id as usize).await.unwrap();
             sender.send(()).unwrap();
         });
 
         Ok(())
     }
 
-    pub async fn start(&self, uring: &IoUringAsync<squeue::Entry128>,) -> std::io::Result<()> {
+    pub async fn start(&self, uring: &IoUringAsync<squeue::Entry128, cqueue::Entry32>,) -> std::io::Result<()> {
   
         self.inner.ctlr.upgrade().unwrap().set_params(uring, self.dev_id(), Params {
             len: std::mem::size_of::<Params>() as u32,
@@ -656,7 +656,7 @@ impl<B: BlockDevice + 'static> Device<B> {
         Ok(())
     }
 
-    pub async fn stop(&self, uring: &IoUringAsync<squeue::Entry128>,) -> std::io::Result<()> {
+    pub async fn stop(&self, uring: &IoUringAsync<squeue::Entry128, cqueue::Entry32>,) -> std::io::Result<()> {
         let ctlr = self.inner.ctlr.upgrade().unwrap();
 
         let _ = ctlr.stop_dev(uring, self.dev_id()).await?;
@@ -680,16 +680,17 @@ impl<B: BlockDevice + 'static> DeviceInner<B> {
         self.info.queue_depth as usize
     }
 
-    async fn handle_queue(&self, uring: std::rc::Rc<IoUringAsync<squeue::Entry128>>, queue_id: usize) -> std::io::Result<()> {
+    async fn handle_queue<Q: BlockDeviceQueue + 'static>(&self, queue: Q, uring: std::rc::Rc<IoUringAsync<squeue::Entry128, cqueue::Entry32>>, queue_id: usize) -> std::io::Result<()> {
         // Mmap the ublk io descriptors for the current io queue. This will
         // automatically be unmapped upon completion of this method.
         let iod_mapping = IODescriptorMapping::new(self.ctrl_fd.as_ref(), self.queue_depth(), queue_id);
     
         // Handle all io operations on the current io queue in parallel.
         let mut io_done_all = Vec::new();
+        let queue = std::rc::Rc::new(queue);
         for tag in 0 .. self.queue_depth() {
             let iod = iod_mapping.get(tag as usize);
-            let io_done = self.handle_io(uring.clone(), queue_id, tag, iod);
+            let io_done = self.handle_io(queue.clone(), uring.clone(), queue_id, tag, iod);
             io_done_all.push(io_done);
         }
     
@@ -699,7 +700,7 @@ impl<B: BlockDevice + 'static> DeviceInner<B> {
         Ok(())
     }
 
-    async fn handle_io(&self, uring: std::rc::Rc<IoUringAsync<squeue::Entry128>>, queue_id: usize, tag: usize, iod: *const IODescriptor) -> std::io::Result<()> {
+    async fn handle_io<Q: BlockDeviceQueue + 'static>(&self, queue: std::rc::Rc<Q>, uring: std::rc::Rc<IoUringAsync<squeue::Entry128, cqueue::Entry32>>, queue_id: usize, tag: usize, iod: *const IODescriptor) -> std::io::Result<()> {
         let logical_block_size = self.bdev.logical_block_size();
         let io: Vec<u8> = vec![0x00; self.info.max_io_buf_bytes as usize];
         let mut cmd_bytes = [0u8; 80];
@@ -724,16 +725,12 @@ impl<B: BlockDevice + 'static> DeviceInner<B> {
                     IOOperation::Read => {
                         let buf = unsafe { 
                             std::slice::from_raw_parts_mut(
-                                iod.addr as *mut MaybeUninit<u8>,
+                                iod.addr as *mut u8,
                                 (iod.nr_sectors << logical_block_size) as usize,
                             )
                         };
-                        let mut read_buf = tokio::io::ReadBuf::uninit(buf);
-                        core::future::poll_fn(|cx| {
-                            self.bdev.poll_read(cx, &mut read_buf)
-                        }).await.unwrap();
-
-                        read_buf.filled().len() as u32
+                        let n = queue.read_at(buf, iod.start_sector << logical_block_size).await.unwrap();
+                        n as u32
                     },
                     IOOperation::Write => {
                         let buf = unsafe { 
@@ -742,10 +739,8 @@ impl<B: BlockDevice + 'static> DeviceInner<B> {
                                 (iod.nr_sectors << logical_block_size) as usize,
                             )
                         };
-
-                        core::future::poll_fn(|cx| {
-                            self.bdev.poll_write(cx, buf)
-                        }).await.unwrap() as u32
+                        let n = queue.write_at(buf, iod.start_sector << logical_block_size).await.unwrap();
+                        n as u32
                     }
                     IOOperation::Flush => panic!("unimplemented operation: flush"),
                     IOOperation::Discard => panic!("unimplemented operation: discard"),

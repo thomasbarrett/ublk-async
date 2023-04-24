@@ -13,3 +13,5 @@ send_wrapper = { version = "0.6.0" }
 zerocopy = "0.6.1"
 futures = "0.3.26"
 libc = "0.2"
+bdev-async = { git = "ssh://git@github.com/thomasbarrett/bdev-async.git", rev = "c867b38" }
+async-trait = "0.1.68"
